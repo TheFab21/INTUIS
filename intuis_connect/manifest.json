@@ -1,0 +1,15 @@
+{
+  "domain": "intuis_connect",
+  "name": "Intuis Connect (Netatmo)",
+  "codeowners": [
+    "@antoine-pyre"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/antoine-pyre/intuis-connect#readme",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/antoine-pyre/intuis-connect/issues",
+  "requirements": [
+    "aiohttp"
+  ],
+  "version": "1.4.0"
+}
