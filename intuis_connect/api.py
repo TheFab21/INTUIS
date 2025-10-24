@@ -350,31 +350,57 @@ class IntuisApi:
         except Exception:
             pass
 
-        # 1) Cas nominal : id à la racine
-        if isinstance(payload, dict) and "id" in payload:
-            return payload
+        def _looks_like_home(obj: dict) -> bool:
+            if not any(key in obj for key in ("rooms", "modules", "capabilities", "timezone", "city")):
+                return False
+            candidate = obj.get("id") or obj.get("_id") or obj.get("home_id")
+            if candidate is None:
+                return False
+            # accepte id numérique mais ignore les objets vides
+            return str(candidate).strip() != ""
 
-        # 2) Wrappers fréquents
-        if isinstance(payload, dict):
-            for k in ("home", "data", "result", "body"):
-                v = payload.get(k)
-                if isinstance(v, dict) and "id" in v:
-                    return v
-                if isinstance(v, list) and v and isinstance(v[0], dict) and "id" in v[0]:
-                    return v[0]
+        def _search_home(obj: Any, depth: int = 0) -> dict | None:
+            if depth > 32:  # sécurité contre la récursion cyclique
+                return None
+            if isinstance(obj, dict):
+                if _looks_like_home(obj):
+                    return obj
 
-            # {"homes": [...]}
-            v = payload.get("homes")
-            if isinstance(v, list) and v and isinstance(v[0], dict) and "id" in v[0]:
-                return v[0]
+                # Explorer en priorité les clés pertinentes
+                for key in ("home", "data", "result", "body"):
+                    if key in obj:
+                        found = _search_home(obj[key], depth + 1)
+                        if found:
+                            return found
 
-        # 3) Réponse en liste simple
-        if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "id" in payload[0]:
-            return payload[0]
+                homes = obj.get("homes")
+                if isinstance(homes, list):
+                    for item in homes:
+                        found = _search_home(item, depth + 1)
+                        if found:
+                            return found
 
-        # 4) Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
+                # Parcours générique de toutes les valeurs
+                for value in obj.values():
+                    found = _search_home(value, depth + 1)
+                    if found:
+                        return found
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _search_home(item, depth + 1)
+                    if found:
+                        return found
+
+            return None
+
+        home = _search_home(payload)
+        if home is not None:
+            return home
+
+        # Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
         try:
-            sample = json.dumps(payload)[:1000]
+            sample = json.dumps(payload, ensure_ascii=False)[:1000]
         except Exception:
             sample = str(payload)[:1000]
         _LOGGER.error("homesdata sans 'id' détectable. Échantillon: %s", sample)
