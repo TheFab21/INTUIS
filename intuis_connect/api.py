@@ -313,7 +313,7 @@ class IntuisApi:
             username=username,
             password=password,
         )
-        self._home_id: Optional[str] = None
+        self._home_cache: Optional[dict[str, Any]] = None
         self._username = username
         self._password = password
 
@@ -350,83 +350,61 @@ class IntuisApi:
         except Exception:
             pass
 
-        # 1) Cas nominal : id à la racine
-        if isinstance(payload, dict) and "id" in payload:
-            return payload
+        def _looks_like_home(obj: dict) -> bool:
+            if not any(key in obj for key in ("rooms", "modules", "capabilities", "timezone", "city")):
+                return False
+            candidate = obj.get("id") or obj.get("_id") or obj.get("home_id")
+            if candidate is None:
+                return False
+            # accepte id numérique mais ignore les objets vides
+            return str(candidate).strip() != ""
 
-        # 2) Wrappers fréquents
-        if isinstance(payload, dict):
-            for k in ("home", "data", "result", "body"):
-                v = payload.get(k)
-                if isinstance(v, dict) and "id" in v:
-                    return v
-                if isinstance(v, list) and v and isinstance(v[0], dict) and "id" in v[0]:
-                    return v[0]
+        def _search_home(obj: Any, depth: int = 0) -> dict | None:
+            if depth > 32:  # sécurité contre la récursion cyclique
+                return None
+            if isinstance(obj, dict):
+                if _looks_like_home(obj):
+                    return obj
 
-            # {"homes": [...]}
-            v = payload.get("homes")
-            if isinstance(v, list) and v and isinstance(v[0], dict) and "id" in v[0]:
-                return v[0]
+                # Explorer en priorité les clés pertinentes
+                for key in ("home", "data", "result", "body"):
+                    if key in obj:
+                        found = _search_home(obj[key], depth + 1)
+                        if found:
+                            return found
 
-        # 3) Réponse en liste simple
-        if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "id" in payload[0]:
-            return payload[0]
+                homes = obj.get("homes")
+                if isinstance(homes, list):
+                    for item in homes:
+                        found = _search_home(item, depth + 1)
+                        if found:
+                            return found
 
-        # 4) Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
+                # Parcours générique de toutes les valeurs
+                for value in obj.values():
+                    found = _search_home(value, depth + 1)
+                    if found:
+                        return found
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _search_home(item, depth + 1)
+                    if found:
+                        return found
+
+            return None
+
+        home = _search_home(payload)
+        if home is not None:
+            return home
+
+        # Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
         try:
-            sample = json.dumps(payload)[:1000]
+            sample = json.dumps(payload, ensure_ascii=False)[:1000]
         except Exception:
             sample = str(payload)[:1000]
         _LOGGER.error("homesdata sans 'id' détectable. Échantillon: %s", sample)
         raise IntuisApiError("Schéma inattendu pour /api/homesdata (clé 'id' introuvable)")
-
-    async def get_home(self) -> dict:
-        """Retourne l’objet home depuis /api/homesdata, en respectant le schéma réel."""
-        if getattr(self, "_home_cache", None):
-            return self._home_cache
-
-        await self.async_authenticate()
-        data = await self._client.get_homesdata()
-
-        home = None
-
-        # Chemin attendu d'après ton retour réel
-        if isinstance(data, dict):
-            body = data.get("body")
-            if isinstance(body, dict):
-                homes = body.get("homes")
-                if isinstance(homes, list) and homes and isinstance(homes[0], dict):
-                    home = homes[0]
-
-        # Fallbacks simples utilisés parfois par des variantes
-        if home is None and isinstance(data, dict):
-            # { "homes": [ {...} ] }
-            homes = data.get("homes")
-            if isinstance(homes, list) and homes and isinstance(homes[0], dict):
-                home = homes[0]
-            # { "home": {...} }
-            if home is None and isinstance(data.get("home"), dict):
-                home = data["home"]
-
-        # Vérifications minimales
-        if not isinstance(home, dict):
-            raise IntuisApiError("Schéma inattendu pour /api/homesdata (objet 'home' introuvable)")
-
-        hid = str(home.get("id") or home.get("_id") or home.get("home_id") or "").strip()
-        if not hid:
-            # Log d’aide au debug avec un échantillon compact
-            try:
-                import json
-                sample = json.dumps(data, ensure_ascii=False)[:800]
-            except Exception:
-                sample = str(data)[:800]
-            _LOGGER.error("homesdata sans 'id' détectable. Échantillon: %s", sample)
-            raise IntuisApiError("Schéma inattendu pour /api/homesdata (clé 'id' introuvable)")
-
-        # Normalisation & cache
-        home["id"] = hid
-        self._home_cache = home
-        return home
 
     async def get_home_id(self) -> str:
         """Retourne l’ID du home (avec cache)."""
@@ -441,8 +419,29 @@ class IntuisApi:
         return hid
 
     async def get_home(self) -> dict:
+        cached = getattr(self, "_home_cache", None)
+        if isinstance(cached, dict) and str(cached.get("id", "")).strip():
+            return cached
+
         payload = await self._client.get_homesdata()
-        return self._extract_home_from_homesdata(payload)
+        home = self._extract_home_from_homesdata(payload)
+
+        if not isinstance(home, dict):  # garde-fou supplémentaire
+            raise IntuisApiError("Schéma inattendu pour /api/homesdata (objet 'home' introuvable)")
+
+        normalized = dict(home)
+        hid = str(normalized.get("id") or normalized.get("_id") or normalized.get("home_id") or "").strip()
+        if not hid:
+            try:
+                sample = json.dumps(payload, ensure_ascii=False)[:800]
+            except Exception:
+                sample = str(payload)[:800]
+            _LOGGER.error("homesdata sans 'id' détectable. Échantillon: %s", sample)
+            raise IntuisApiError("Schéma inattendu pour /api/homesdata (clé 'id' introuvable)")
+
+        normalized["id"] = hid
+        self._home_cache = normalized
+        return normalized
 
 
     async def homestatus(self, home_id: Optional[str] = None) -> Dict[str, Any]:
