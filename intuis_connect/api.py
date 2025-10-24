@@ -351,6 +351,85 @@ class IntuisApi:
         except Exception:
             pass
 
+        # Recherche itérative (BFS) afin d’identifier l’objet home le plus crédible.
+        hints = {
+            "rooms": 4,
+            "modules": 3,
+            "therm_schedules": 3,
+            "schedules": 3,
+            "modules_bridged": 2,
+            "capabilities": 2,
+            "timezone": 1,
+            "city": 1,
+            "name": 1,
+        }
+
+        def _score_candidate(obj: dict) -> int:
+            score = 0
+            for key, weight in hints.items():
+                if key not in obj:
+                    continue
+                value = obj[key]
+                if isinstance(value, (list, dict)):
+                    if value:
+                        score += weight
+                elif value not in (None, ""):
+                    score += weight
+            # Favor real home dictionaries that expose child rooms explicitly.
+            if "rooms" in obj and isinstance(obj["rooms"], list):
+                score += 5
+            return score
+
+        queue: deque[Any] = deque([payload])
+        seen: set[int] = set()
+        best: dict | None = None
+        best_score = -1
+
+        while queue:
+            current = queue.popleft()
+
+            if isinstance(current, (dict, list)):
+                obj_id = id(current)
+                if obj_id in seen:
+                    continue
+                seen.add(obj_id)
+
+            if isinstance(current, dict):
+                candidate = (
+                    current.get("id")
+                    or current.get("_id")
+                    or current.get("home_id")
+                )
+                if candidate is not None:
+                    candidate_str = str(candidate).strip()
+                    if candidate_str:
+                        score = _score_candidate(current)
+                        better = score > best_score
+                        if not better and best is not None and score == best_score:
+                            # Prefer candidates that actually look like a home
+                            better = "rooms" in current and "rooms" not in best
+                        if better:
+                            best = current
+                            best_score = score
+
+                # Priorité aux wrappers courants : on les traite en premier
+                for key in ("home", "body", "data", "result", "homes"):
+                    value = current.get(key)
+                    if isinstance(value, (dict, list)):
+                        queue.appendleft(value)
+
+                # Puis parcours générique pour couvrir tous les cas restants
+                for value in current.values():
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+
+            elif isinstance(current, list):
+                for item in current:
+                    if isinstance(item, (dict, list)):
+                        queue.append(item)
+
+        if best is not None:
+            return best
         def _looks_like_home(obj: dict) -> bool:
             if not any(key in obj for key in ("rooms", "modules", "capabilities", "timezone", "city")):
                 return False
