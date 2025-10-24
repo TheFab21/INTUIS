@@ -430,6 +430,53 @@ class IntuisApi:
 
         if best is not None:
             return best
+        def _looks_like_home(obj: dict) -> bool:
+            if not any(key in obj for key in ("rooms", "modules", "capabilities", "timezone", "city")):
+                return False
+            candidate = obj.get("id") or obj.get("_id") or obj.get("home_id")
+            if candidate is None:
+                return False
+            # accepte id numérique mais ignore les objets vides
+            return str(candidate).strip() != ""
+
+        def _search_home(obj: Any, depth: int = 0) -> dict | None:
+            if depth > 32:  # sécurité contre la récursion cyclique
+                return None
+            if isinstance(obj, dict):
+                if _looks_like_home(obj):
+                    return obj
+
+                # Explorer en priorité les clés pertinentes
+                for key in ("home", "data", "result", "body"):
+                    if key in obj:
+                        found = _search_home(obj[key], depth + 1)
+                        if found:
+                            return found
+
+                homes = obj.get("homes")
+                if isinstance(homes, list):
+                    for item in homes:
+                        found = _search_home(item, depth + 1)
+                        if found:
+                            return found
+
+                # Parcours générique de toutes les valeurs
+                for value in obj.values():
+                    found = _search_home(value, depth + 1)
+                    if found:
+                        return found
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _search_home(item, depth + 1)
+                    if found:
+                        return found
+
+            return None
+
+        home = _search_home(payload)
+        if home is not None:
+            return home
 
         # Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
         try:
