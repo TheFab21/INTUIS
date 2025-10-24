@@ -351,80 +351,53 @@ class IntuisApi:
         except Exception:
             pass
 
-        # Recherche itérative (BFS) afin d’identifier l’objet home le plus crédible.
-        hints = {
-            "rooms": 4,
-            "modules": 3,
-            "therm_schedules": 3,
-            "schedules": 3,
-            "modules_bridged": 2,
-            "capabilities": 2,
-            "timezone": 1,
-            "city": 1,
-            "name": 1,
-        }
+        def _looks_like_home(obj: dict) -> bool:
+            if not any(key in obj for key in ("rooms", "modules", "capabilities", "timezone", "city")):
+                return False
+            candidate = obj.get("id") or obj.get("_id") or obj.get("home_id")
+            if candidate is None:
+                return False
+            # accepte id numérique mais ignore les objets vides
+            return str(candidate).strip() != ""
 
-        def _score_candidate(obj: dict) -> int:
-            score = 0
-            for key, weight in hints.items():
-                if key not in obj:
-                    continue
-                value = obj[key]
-                if isinstance(value, (list, dict)):
-                    if value:
-                        score += weight
-                elif value not in (None, ""):
-                    score += weight
-            return score
+        def _search_home(obj: Any, depth: int = 0) -> dict | None:
+            if depth > 32:  # sécurité contre la récursion cyclique
+                return None
+            if isinstance(obj, dict):
+                if _looks_like_home(obj):
+                    return obj
 
-        queue: deque[Any] = deque([payload])
-        seen: set[int] = set()
-        best: dict | None = None
-        best_score = -1
+                # Explorer en priorité les clés pertinentes
+                for key in ("home", "data", "result", "body"):
+                    if key in obj:
+                        found = _search_home(obj[key], depth + 1)
+                        if found:
+                            return found
 
-        while queue:
-            current = queue.popleft()
+                homes = obj.get("homes")
+                if isinstance(homes, list):
+                    for item in homes:
+                        found = _search_home(item, depth + 1)
+                        if found:
+                            return found
 
-            if isinstance(current, (dict, list)):
-                obj_id = id(current)
-                if obj_id in seen:
-                    continue
-                seen.add(obj_id)
+                # Parcours générique de toutes les valeurs
+                for value in obj.values():
+                    found = _search_home(value, depth + 1)
+                    if found:
+                        return found
 
-            if isinstance(current, dict):
-                candidate = (
-                    current.get("id")
-                    or current.get("_id")
-                    or current.get("home_id")
-                )
-                if candidate is not None:
-                    candidate_str = str(candidate).strip()
-                    if candidate_str:
-                        score = _score_candidate(current)
-                        if best is None or score > best_score:
-                            best = current
-                            best_score = score
-                            if score >= 4:
-                                break
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _search_home(item, depth + 1)
+                    if found:
+                        return found
 
-                # Priorité aux wrappers courants : on les traite en premier
-                for key in ("home", "body", "data", "result", "homes"):
-                    value = current.get(key)
-                    if isinstance(value, (dict, list)):
-                        queue.appendleft(value)
+            return None
 
-                # Puis parcours générique pour couvrir tous les cas restants
-                for value in current.values():
-                    if isinstance(value, (dict, list)):
-                        queue.append(value)
-
-            elif isinstance(current, list):
-                for item in current:
-                    if isinstance(item, (dict, list)):
-                        queue.append(item)
-
-        if best is not None:
-            return best
+        home = _search_home(payload)
+        if home is not None:
+            return home
 
         # Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
         try:
