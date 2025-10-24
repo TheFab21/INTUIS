@@ -1,15 +1,12 @@
 {
   "domain": "intuis_connect",
-  "name": "Intuis Connect (Netatmo)",
-  "codeowners": [
-    "@antoine-pyre"
-  ],
+  "name": "Intuis Connect (Heating)",
+  "version": "0.3.3",
   "config_flow": true,
-  "documentation": "https://github.com/antoine-pyre/intuis-connect#readme",
-  "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/antoine-pyre/intuis-connect/issues",
-  "requirements": [
-    "aiohttp"
+  "codeowners": [
+    "@TheFab21"
   ],
-  "version": "1.4.0"
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "requirements": []
 }

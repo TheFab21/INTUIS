@@ -1,0 +1,362 @@
+from __future__ import annotations
+import aiohttp
+import time
+import logging
+from typing import Any, Optional
+
+_LOGGER = logging.getLogger(__name__)
+
+BASE_HOST = "https://app.muller-intuitiv.net"
+
+# Auth Intuis (valeurs confirmées)
+CLIENT_ID = "59e604948fe283fd4dc7e355"
+CLIENT_SECRET = "rAeWu8Y3YqXEPqRJ4BpFzFG98MRXpCcz"
+AUTH_SCOPE = "read_muller write_muller"
+USER_PREFIX = "muller"
+APP_VERSION = "app_muller"
+
+
+class IntuisApiError(Exception):
+    pass
+
+
+class _HttpClient:
+    def __init__(self, session: aiohttp.ClientSession):
+        self._session = session
+        self._token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._token_exp: float = 0.0
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict | None = None,
+        form: dict | None = None,
+        content_type: str | None = None,
+        auth: bool = True,
+    ) -> dict:
+        headers: dict[str, str] = {}
+        data = None
+
+        if form is not None:
+            data = aiohttp.FormData()
+            for k, v in form.items():
+                if v is None:
+                    continue
+                data.add_field(k, str(v))
+            if content_type:
+                headers["Content-Type"] = content_type
+        elif json is not None:
+            headers["Content-Type"] = "application/json"
+
+        if auth:
+            await self.ensure_token()
+            headers["Authorization"] = f"Bearer {self._token}"
+
+        async with self._session.request(method, url, json=json, data=data, headers=headers) as resp:
+            if resp.status >= 400:
+                try:
+                    err_text = await resp.text()
+                except Exception:
+                    err_text = "<no body>"
+                raise IntuisApiError(f"{method} {url} -> {resp.status} {resp.reason} | body: {err_text}")
+            try:
+                return await resp.json(content_type=None)
+            except Exception as e:
+                raise IntuisApiError(f"Invalid JSON from {url}: {e}") from e
+
+    # ---------- Auth ----------
+    async def ensure_token(self):
+        now = time.time()
+        if self._token and now < self._token_exp - 30:
+            return
+        if self._refresh_token:
+            await self.refresh()
+            return
+        raise IntuisApiError("Not authenticated")
+
+    async def login(self, username: str, password: str) -> dict:
+        form = {
+            "client_id": CLIENT_ID,
+            "user_prefix": USER_PREFIX,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "password",
+            "scope": AUTH_SCOPE,
+            "password": password,
+            "username": username,
+        }
+        data = await self._request_json(
+            "POST",
+            f"{BASE_HOST}/oauth2/token",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+            auth=False,
+        )
+        self._token = data.get("access_token")
+        self._refresh_token = data.get("refresh_token")
+        self._token_exp = time.time() + int(data.get("expires_in", 3600))
+        return data
+
+    async def refresh(self) -> dict:
+        if not self._refresh_token:
+            raise IntuisApiError("No refresh token")
+        form = {
+            "client_id": CLIENT_ID,
+            "user_prefix": USER_PREFIX,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token,
+        }
+        data = await self._request_json(
+            "POST",
+            f"{BASE_HOST}/oauth2/token",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+            auth=False,
+        )
+        self._token = data.get("access_token")
+        self._refresh_token = data.get("refresh_token", self._refresh_token)
+        self._token_exp = time.time() + int(data.get("expires_in", 3600))
+        return data
+
+    # ---------- Lecture ----------
+    async def get_homesdata(self) -> dict:
+        return await self._request_json("GET", f"{BASE_HOST}/api/homesdata")
+
+    async def post_homestatus(self, home_id: str) -> dict:
+        form = {"home_id": home_id}
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/syncapi/v1/homestatus",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+        )
+
+    async def post_getconfigs(self, home_id: str) -> dict:
+        form = {"home_id": home_id}
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/syncapi/v1/getconfigs",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+        )
+
+    async def post_gethomemeasure(
+        self,
+        home_id: str,
+        *,
+        scale: str,
+        offset: int = 0,
+        limit: int = 30,
+        rtype: str | None = None,
+    ) -> dict:
+        form = {
+            "home_id": home_id,
+            "scale": scale,
+            "offset": int(offset),
+            "limit": int(limit),
+        }
+        if rtype:
+            form["type"] = rtype  # ex: "energy"
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/api/gethomemeasure",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+        )
+
+    # ---------- Écriture ----------
+    _ALLOWED_ROOM_MODES = {"manual", "home", "hg", "off", "away"}
+
+    async def post_setstate_rooms(
+        self,
+        *,
+        home_id: str,
+        room_id: str,
+        mode: str,
+        temp: float | None = None,
+        endtime: int | None = None,
+    ) -> dict:
+        m = (mode or "").lower()
+        if m not in self._ALLOWED_ROOM_MODES:
+            raise IntuisApiError(f"Unsupported room mode: {mode}")
+
+        body_room: dict[str, Any] = {
+            "id": room_id,
+            "therm_setpoint_mode": m,
+        }
+
+        if m == "manual" and isinstance(temp, (int, float)):
+            body_room["therm_setpoint_temperature"] = float(temp)
+
+        now = int(time.time())
+        if endtime is not None:
+            body_room["therm_setpoint_end_time"] = int(endtime)
+        elif m == "manual":
+            # permanent tant qu’on ne change pas
+            body_room["therm_setpoint_end_time"] = now - 60
+
+        payload = {"home": {"id": home_id, "rooms": [body_room]}}
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/syncapi/v1/setstate",
+            json=payload,
+            form=None,
+            content_type=None,
+        )
+
+
+class IntuisApi:
+    """Façade simple utilisée par le coordinator / entities."""
+
+    def __init__(self, session: aiohttp.ClientSession, username: str, password: str, **kwargs):
+        self._client = _HttpClient(session)
+        self._username = username
+        self._password = password
+        self._home_id: Optional[str] = None
+        self._home_cache: Optional[dict] = None
+
+    # ---- auth ----
+    async def async_authenticate(self) -> None:
+        try:
+            await self._client.ensure_token()
+        except IntuisApiError:
+            await self.login()
+
+    async def login(self) -> dict:
+        return await self._client.login(self._username, self._password)
+
+    # ---- helpers ----
+    def _looks_like_home(self, node: Any) -> bool:
+        if not isinstance(node, dict):
+            return False
+        if "id" not in node:
+            return False
+        for k in ("rooms", "modules", "therm_schedules", "schedules", "temperature_control_mode", "therm_mode"):
+            if k in node:
+                return True
+        return False
+
+    def _find_home_recursive(self, obj: Any) -> Optional[dict]:
+        try:
+            if self._looks_like_home(obj):
+                return obj
+            if isinstance(obj, dict):
+                for key in ("home", "body", "data", "homes"):
+                    if key in obj:
+                        found = self._find_home_recursive(obj[key])
+                        if found:
+                            return found
+                for v in obj.values():
+                    found = self._find_home_recursive(v)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for it in obj:
+                    found = self._find_home_recursive(it)
+                    if found:
+                        return found
+        except Exception:
+            return None
+        return None
+
+    # ---- home discovery ----
+    async def get_home(self) -> dict:
+        await self.async_authenticate()
+        data = await self._client.get_homesdata()
+
+        home: Optional[dict] = None
+
+        if isinstance(data, dict) and self._looks_like_home(data):
+            home = data
+
+        if home is None and isinstance(data, dict) and isinstance(data.get("homes"), list) and data["homes"]:
+            cand = data["homes"][0]
+            if isinstance(cand, dict) and self._looks_like_home(cand):
+                home = cand
+
+        if home is None:
+            home = self._find_home_recursive(data)
+
+        if not isinstance(home, dict):
+            _LOGGER.debug(
+                "homesdata unexpected shape: type=%s keys=%s sample=%s",
+                type(data),
+                list(data.keys()) if isinstance(data, dict) else None,
+                str(data)[:600],
+            )
+            raise IntuisApiError("Format inattendu de /api/homesdata (home non trouvé)")
+
+        hid = home.get("id") or home.get("_id")
+        if not hid:
+            _LOGGER.debug("Found home-like object but no id: %s", str(home)[:400])
+            raise IntuisApiError("home_id manquant dans /api/homesdata")
+
+        self._home_id = hid
+        self._home_cache = home
+        return home
+
+    async def get_home_id(self) -> str:
+        """Retourne l'id du home (avec cache)."""
+        if self._home_id:
+            return self._home_id
+        home = await self.get_home()
+        hid = str(home.get("id") or "")
+        if not hid:
+            raise IntuisApiError("Impossible de déterminer home_id")
+        self._home_id = hid
+        return hid
+
+    async def get_homesdata(self) -> dict:
+        await self.async_authenticate()
+        return await self._client.get_homesdata()
+
+    # ---- data fetch ----
+    async def homestatus(self, home_id: str | None = None) -> dict:
+        await self.async_authenticate()
+        hid = home_id or self._home_id or (await self.get_home_id())
+        return await self._client.post_homestatus(hid)
+
+    async def getconfigs(self, home_id: str | None = None) -> dict:
+        await self.async_authenticate()
+        hid = home_id or self._home_id or (await self.get_home_id())
+        return await self._client.post_getconfigs(hid)
+
+    async def gethomemeasure(
+        self,
+        home_id: str | None = None,
+        *,
+        scale: str,
+        offset: int = 0,
+        limit: int = 30,
+        rtype: str | None = None,
+        **kwargs,
+    ) -> dict:
+        await self.async_authenticate()
+        hid = home_id or self._home_id or (await self.get_home_id())
+        if rtype is None and "type" in kwargs:
+            rtype = kwargs.get("type")
+        return await self._client.post_gethomemeasure(
+            hid, scale=scale, offset=offset, limit=limit, rtype=rtype
+        )
+
+    # ---- actions pièce ----
+    async def set_room_setpoint(self, home_id: str, room_id: str, temp: float, duration: int | None = None) -> dict:
+        endtime: int | None = None
+        if isinstance(duration, (int, float)) and duration > 0:
+            endtime = int(time.time() + duration * 60)
+        await self.async_authenticate()
+        return await self._client.post_setstate_rooms(
+            home_id=home_id, room_id=room_id, mode="manual", temp=float(temp), endtime=endtime
+        )
+
+    async def set_room_mode(self, home_id: str, room_id: str, mode: str, duration: int | None = None) -> dict:
+        endtime: int | None = None
+        if isinstance(duration, (int, float)) and duration > 0:
+            endtime = int(time.time() + duration * 60)
+        await self.async_authenticate()
+        return await self._client.post_setstate_rooms(
+            home_id=home_id, room_id=room_id, mode=mode, endtime=endtime
+        )
