@@ -1,379 +1,503 @@
-"""Async API client for Intuis Connect cloud."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import aiohttp
 
-from .const import (
-    BASE_URLS,
-    AUTH_PATH,
-    HOMESDATA_PATH,
-    HOMESTATUS_PATH,
-    SETSTATE_PATH,
-    HOMEMEASURE_PATH,
-    CLIENT_ID,
-    CLIENT_SECRET,
-    AUTH_SCOPE,
-    USER_PREFIX,
-    APP_TYPE,
-    APP_VERSION,
-    DEFAULT_MANUAL_DURATION,
-    ENERGY_BASE,
-    GET_SCHEDULE_PATH,
-    SET_SCHEDULE_PATH,
-    DELETE_SCHEDULE_PATH,
-    SWITCH_SCHEDULE_PATH,
-)
-
 _LOGGER = logging.getLogger(__name__)
 
+BASE_HOST = "https://app.muller-intuitiv.net"
 
-class CannotConnect(Exception):
-    """Errors related to connectivity."""
-
-
-class InvalidAuth(Exception):
-    """Authentication/Token errors."""
+# ---- Exceptions ----------------------------------------------------------------
 
 
-class APIError(Exception):
-    """Generic API errors."""
+class IntuisApiError(Exception):
+    pass
 
 
-class IntuisAPI:
-    """Minimal client wrapping the Intuis Netatmo endpoints."""
+# ---- Low-level HTTP client with auth -------------------------------------------
 
+
+@dataclass
+class _AuthState:
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    expires_at: Optional[float] = None  # epoch seconds
+
+
+class IntuisHttpClient:
     def __init__(
-            self, session: aiohttp.ClientSession, home_id: str | None = None
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        client_id: str,
+        client_secret: str,
+        scope: str,
+        user_prefix: str,
+        username: str,
+        password: str,
     ) -> None:
-        """Initialize the API client."""
         self._session = session
-        self._base_url: str = BASE_URLS[0]
-        self.home_id: str | None = home_id
-        self.home_timezone: str = "GMT"
-        self._access_token: str | None = None
-        self._refresh_token: str | None = None
-        self._expiry: float | None = None
-        _LOGGER.debug("IntuisAPI initialized with home_id=%s", home_id)
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._scope = scope
+        self._user_prefix = user_prefix
+        self._username = username
+        self._password = password
+        self._auth = _AuthState()
 
-    @property
-    def refresh_token(self) -> str | None:
-        """Return the current refresh token."""
-        return self._refresh_token
+    def _auth_headers(self) -> Dict[str, str]:
+        if not self._auth.access_token:
+            return {}
+        return {"Authorization": f"Bearer {self._auth.access_token}"}
 
-    @refresh_token.setter
-    def refresh_token(self, value: str) -> None:
-        """Set the refresh token."""
-        self._refresh_token = value
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Any | None = None,
+        form: Dict[str, Any] | None = None,
+        content_type: str | None = None,
+        auth: bool = True,
+    ) -> Any:
+        headers: Dict[str, str] = {}
+        if auth:
+            headers.update(self._auth_headers())
+        if content_type:
+            headers["Content-Type"] = content_type
 
-    # ---------- internal helpers ------------------------------------------------
-    async def _ensure_token(self) -> None:
-        """Ensure the access token is valid, refreshing it if necessary."""
-        _LOGGER.debug("Ensuring access token is valid")
-        if self._access_token is None:
-            _LOGGER.error("No access token available, authentication required")
-            raise InvalidAuth("No access token – login first")
-        if self._expiry and asyncio.get_running_loop().time() > self._expiry - 60:
-            _LOGGER.debug("Access token expired or about to expire, refreshing token")
-            await self.async_refresh_access_token()
-        else:
-            _LOGGER.debug("Access token is valid")
+        data = None
+        if form is not None:
+            data = aiohttp.FormData()
+            for k, v in form.items():
+                if v is None:
+                    continue
+                data.add_field(k, str(v))
 
-    def _save_tokens(self, data: dict[str, Any]) -> None:
-        """Save the tokens and expiry time from an auth response."""
-        _LOGGER.debug("Saving tokens, expires in %s seconds", data.get("expires_in"))
-        self._access_token = data["access_token"]
-        self._refresh_token = data.get("refresh_token")
-        self._expiry = asyncio.get_running_loop().time() + data.get("expires_in", 10800)
-
-    async def _async_request(
-            self, method: str, path: str, retry: bool = True, **kwargs: Any
-    ) -> aiohttp.ClientResponse:
-        """Make a request and handle token refresh."""
-        await self._ensure_token()
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {self._access_token}"
-
-        url = f"{self._base_url}{path}"
-        _LOGGER.debug("Making API request: %s %s", method, url)
-
-        try:
-            resp = await self._session.request(
-                method, url, headers=headers, timeout=10, **kwargs
-            )
-
-            if resp.status == 401 and retry:
-                _LOGGER.warning(
-                    "Request unauthorized (401), refreshing token and retrying."
-                )
-                await self.async_refresh_access_token()
-                # Call self again, but without retry to avoid infinite loop
-                return await self._async_request(method, path, retry=False, **kwargs)
-
-            resp.raise_for_status()
-            return resp
-
-        except aiohttp.ClientResponseError as e:
-            _LOGGER.error("API request failed for %s: %s", path, e)
-            raise APIError(f"Request failed for {path}: {e.status}") from e
-        except aiohttp.ClientError as e:
-            _LOGGER.error("Cannot connect to API for %s: %s", path, e)
-            raise CannotConnect(f"Cannot connect for {path}") from e
-
-    # ---------- auth ------------------------------------------------------------
-    async def async_login(self, username: str, password: str) -> str:
-        """Log in to the Intuis Connect service."""
-        _LOGGER.debug("Attempting login for user %s", username)
-        payload = {
-            "grant_type": "password",
-            "username": username,
-            "password": password,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "scope": AUTH_SCOPE,
-            "user_prefix": USER_PREFIX,
-            "app_version": APP_VERSION,
-        }
-        for base in BASE_URLS:
+        async with self._session.request(
+            method, url, headers=headers, json=json, data=data
+        ) as resp:
+            if resp.status >= 400:
+                try:
+                    err_text = await resp.text()
+                except Exception:
+                    err_text = "<no body>"
+                raise IntuisApiError(f"{method} {url} -> {resp.status} {resp.reason} | body: {err_text}")
             try:
-                _LOGGER.debug("Trying authentication endpoint %s", base + AUTH_PATH)
-                async with self._session.post(
-                        f"{base}{AUTH_PATH}", data=payload, timeout=15
-                ) as resp:
-                    if resp.status != 200:
-                        _LOGGER.warning(
-                            "Login failed on %s status %s", base, resp.status
-                        )
-                        continue
-                    data = await resp.json()
-                    if "access_token" in data:
-                        _LOGGER.debug("Login successful on %s", base)
-                        self._base_url = base
-                        self._save_tokens(data)
-                        break
-                    else:
-                        _LOGGER.warning(
-                            "Login response on %s did not contain access_token", base
-                        )
-            except aiohttp.ClientError as e:
-                _LOGGER.warning("Client error during login on %s: %s", base, e)
-                continue
-        else:
-            _LOGGER.error("Unable to log in on any cluster")
-            raise CannotConnect("Unable to log in on any cluster")
+                return await resp.json(content_type=None)
+            except Exception as e:
+                text = await resp.text()
+                raise IntuisApiError(f"Invalid JSON from {url}: {e} | body: {text}") from e
 
-        _LOGGER.debug("Retrieving homes data post-login for token validation")
-        await self.async_get_homes_data()
-        if not self.home_id:
-            _LOGGER.error("Login completed but no home associated with account")
-            raise InvalidAuth("No home associated with account")
-        _LOGGER.debug("Login completed, home_id=%s", self.home_id)
-        return self.home_id
+    def _token_expiring(self) -> bool:
+        if not self._auth.expires_at:
+            return True
+        # refresh a bit early (60s)
+        return time.time() >= (self._auth.expires_at - 60)
 
-    async def async_refresh_access_token(self) -> None:
-        """Refresh the access token."""
-        _LOGGER.debug(
-            "Refreshing access token using refresh_token=%s", self._refresh_token
-        )
-        if not self._refresh_token:
-            _LOGGER.error("No refresh token saved, cannot refresh access token")
-            raise InvalidAuth("No refresh token saved")
+    async def ensure_token(self) -> None:
+        if self._auth.access_token and not self._token_expiring():
+            return
+        # try refresh
+        if self._auth.refresh_token:
+            try:
+                await self._refresh()
+                return
+            except IntuisApiError as e:
+                _LOGGER.warning("Token refresh failed, fallback to login: %s", e)
+        # login
+        await self.login()
+
+    async def login(self) -> Dict[str, Any]:
+        # Muller/Intuis OAuth2 password grant
         payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": self._refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "user_prefix": USER_PREFIX,
+            "client_id": self._client_id,
+            "user_prefix": self._user_prefix,
+            "client_secret": self._client_secret,
+            "grant_type": "password",
+            "scope": self._scope,
+            "password": self._password,
+            "username": self._username,
         }
-        async with self._session.post(
-                f"{self._base_url}{AUTH_PATH}", data=payload, timeout=10
-        ) as resp:
-            if resp.status != 200:
-                _LOGGER.error("Token refresh failed with status %s", resp.status)
-                raise InvalidAuth("Token refresh failed")
-            data = await resp.json()
-            _LOGGER.debug(
-                "Token refresh successful, new expiry in %s seconds",
-                data.get("expires_in"),
-            )
-            self._save_tokens(data)
 
-    # ---------- data endpoints ---------------------------------------------------
-    async def async_get_homes_data(self) -> dict[str, Any]:
-        """Fetch homes data from the API."""
-        _LOGGER.debug("Fetching homes data from %s", self._base_url + HOMESDATA_PATH)
-        async with await self._async_request("get", HOMESDATA_PATH) as resp:
-            data = await resp.json()
-
-        if not data.get("body", {}).get("homes"):
-            _LOGGER.error("Homes data response is empty or malformed: %s", data)
-            raise APIError("Empty homesdata response")
-        _LOGGER.debug("Homes data received: %s", data)
-        home = data.get("body", {}).get("homes", [])[0]
-        self.home_id = home["id"]
-        self.home_timezone = home.get("timezone", "GMT")
-        _LOGGER.debug(
-            "Home id set to %s with timezone %s", self.home_id, self.home_timezone
-        )
-        return home
-
-    async def async_get_home_status(self) -> dict[str, Any]:
-        """Fetch the status of the home."""
-        _LOGGER.debug("Fetching home status for home_id=%s", self.home_id)
-        payload = {"home_id": self.home_id}
-        async with await self._async_request(
-                "post", HOMESTATUS_PATH, data=payload
-        ) as resp:
-            result = await resp.json()
-        _LOGGER.debug("Home status response: %s", result)
-        home = result.get("body", {}).get("home", {})
-        if not home:
-            _LOGGER.error("Home status response is empty or malformed: %s", result)
-            raise APIError("Empty home status response")
-        return home
-
-    async def async_set_room_state(
-            self,
-            room_id: str,
-            mode: str,
-            temp: float | None = None,
-            duration: int | None = None,
-    ) -> None:
-        """Send setstate command for one room."""
-        _LOGGER.debug(
-            "Setting room state for room %s: mode=%s, temp=%s, duration=%s",
-            room_id,
-            mode,
-            temp,
-            duration,
-        )
-        room_payload: dict[str, Any] = {"id": room_id, "therm_setpoint_mode": mode}
-        if mode == "manual":
-            if temp is None:
-                raise APIError("Manual mode requires temperature")
-            end = int(time.time()) + (duration or DEFAULT_MANUAL_DURATION) * 60
-            room_payload.update(
-                {"therm_setpoint_temperature": float(temp), "therm_setpoint_end_time": end}
-            )
-        payload = {
-            "app_type": APP_TYPE,
-            "app_version": APP_VERSION,
-            "home": {
-                "id": self.home_id,
-                "rooms": [room_payload],
-                "timezone": self.home_timezone,
-            },
-        }
-        await self._async_request(
-            "post",
-            SETSTATE_PATH,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        _LOGGER.info("Room %s state set to mode=%s, temp=%s", room_id, mode, temp)
-
-    async def async_get_home_measure(self, room_id: str, date_iso: str) -> float:
-        """Return kWh for given room and date (YYYY-MM-DD) or 0.0 on failure."""
-        _LOGGER.debug(
-            "Fetching home measure for room %s on date %s", room_id, date_iso
-        )
-        payload = {
-            "home_id": self.home_id,
-            "room_id": room_id,
-            "scale": "1day",
-            "type": "sum_energy",
-            "date_begin": date_iso,
-            "date_end": date_iso,
-        }
-        try:
-            async with await self._async_request(
-                    "post", HOMEMEASURE_PATH, data=payload
-            ) as resp:
-                data = await resp.json()
-            _LOGGER.debug("Home measure data received: %s", data)
-            measures = data.get("body", {}).get("measure", [])
-            if not measures:
-                _LOGGER.debug(
-                    "No measure data in response for room %s on date %s",
-                    room_id,
-                    date_iso,
+        # Quelques réessais sur erreurs 5xx parfois renvoyées par /oauth2/token
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                data = await self._request_json(
+                    "POST", f"{BASE_HOST}/oauth2/token", form=payload, content_type="application/x-www-form-urlencoded", auth=False
                 )
-                return 0.0
-            return float(measures[0][1])
-        except APIError:
-            _LOGGER.warning(
-                "Home measure request failed for room %s on date %s, returning 0.0",
-                room_id,
-                date_iso,
-                exc_info=True,
-            )
-            return 0.0
+                self._store_tokens(data)
+                _LOGGER.debug("Logged in, token expires in %ss", data.get("expires_in"))
+                return data
+            except IntuisApiError as e:
+                last_exc = e
+                _LOGGER.error("Auth transient error, retry %d/3: %s", attempt, e)
+                await asyncio.sleep(1.5 * attempt)
+        raise IntuisApiError(f"Login failed: {last_exc}")
 
-    async def async_get_schedule(
-            self, home_id: str, schedule_id: int
-    ) -> dict[str, list[dict[str, Any]]]:
-        """
-        Fetch the full timetable for a given schedule.
-
-        Returns a dict { room_id: [ { id, start, end, temp }, … ], … }.
-        """
-        await self._ensure_token()
-        params = {"home_id": home_id, "schedule_id": schedule_id}
-        url = f"{ENERGY_BASE}{GET_SCHEDULE_PATH}"
-        async with self._session.get(url, params=params, timeout=10) as resp:
-            if resp.status != 200:
-                raise APIError(f"get_schedule failed (HTTP {resp.status})")
-            body = await resp.json()
-        rooms: dict[str, list[dict[str, Any]]] = {}
-        for room in body.get("rooms", []):
-            rid = room["room_id"]
-            rooms[rid] = room.get("slots", [])
-        return rooms
-
-    async def async_set_schedule_slot(
-            self,
-            home_id: str,
-            schedule_id: int,
-            room_id: str,
-            start: str,
-            end: str,
-            temperature: float,
-    ) -> None:
-        """Create or update a single timeslot in the given schedule."""
-        await self._ensure_token()
+    async def _refresh(self) -> Dict[str, Any]:
+        if not self._auth.refresh_token:
+            raise IntuisApiError("No refresh_token")
         payload = {
-            "home_id": home_id,
-            "schedule_id": schedule_id,
-            "zones": [
-                {
-                    "room_id": room_id,
-                    "timetable": [{"start": start, "end": end, "temp": temperature}],
-                }
-            ],
+            "client_id": self._client_id,
+            "user_prefix": self._user_prefix,
+            "client_secret": self._client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": self._auth.refresh_token,
         }
-        url = f"{ENERGY_BASE}{SET_SCHEDULE_PATH}"
-        async with self._session.post(url, json=payload, timeout=10) as resp:
-            if resp.status not in (200, 204):
-                raise APIError(f"set_schedule_slot failed (HTTP {resp.status})")
+        data = await self._request_json(
+            "POST", f"{BASE_HOST}/oauth2/token", form=payload, content_type="application/x-www-form-urlencoded", auth=False
+        )
+        self._store_tokens(data)
+        _LOGGER.debug("Refreshed token, expires in %ss", data.get("expires_in"))
+        return data
 
-    async def async_delete_schedule_slot(self, home_id: str, slot_id: str) -> None:
-        """Delete a specific schedule slot by its ID."""
-        await self._ensure_token()
-        params = {"home_id": home_id, "slot_id": slot_id}
-        url = f"{ENERGY_BASE}{DELETE_SCHEDULE_PATH}"
-        async with self._session.delete(url, params=params, timeout=10) as resp:
-            if resp.status not in (200, 204):
-                raise APIError(f"delete_schedule_slot failed (HTTP {resp.status})")
+    def _store_tokens(self, data: Dict[str, Any]) -> None:
+        self._auth.access_token = data.get("access_token")
+        self._auth.refresh_token = data.get("refresh_token", self._auth.refresh_token)
+        expires_in = data.get("expires_in")
+        if isinstance(expires_in, (int, float)):
+            self._auth.expires_at = time.time() + float(expires_in)
+        else:
+            self._auth.expires_at = time.time() + 3600
 
-    async def async_switch_schedule(self, home_id: str, schedule_id: int) -> None:
-        """Switch the active weekly schedule."""
-        await self._ensure_token()
-        payload = {"home_id": home_id, "schedule_id": schedule_id}
-        url = f"{ENERGY_BASE}{SWITCH_SCHEDULE_PATH}"
-        async with self._session.post(url, json=payload, timeout=10) as resp:
-            if resp.status not in (200, 204):
-                raise APIError(f"switch_schedule failed (HTTP {resp.status})")
+    # ---- Raw endpoints used by higher-level API ----
+
+
+    async def get_homesdata(self) -> dict:
+        """GET /api/homesdata -> dict (home à la racine).
+        On tolère si le serveur renvoie du JSON sous forme de str.
+        """
+        await self.ensure_token()
+        raw = await self._request_json("GET", f"{BASE_HOST}/api/homesdata", auth=True)
+
+        # Si l’API renvoie une chaîne JSON, on la reparse
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                _LOGGER.error("homesdata: reçu une chaîne non-JSON (len=%s): %r", len(raw), raw[:200])
+                raise IntuisApiError("Réponse /api/homesdata non JSON")
+
+        if not isinstance(raw, (dict, list)):
+            _LOGGER.error("homesdata: type inattendu: %s - extrait=%r", type(raw), str(raw)[:300])
+            raise IntuisApiError("Schéma inattendu pour /api/homesdata")
+
+        return raw
+
+
+    async def post_homestatus(self, home_id: str) -> Dict[str, Any]:
+        await self.ensure_token()
+        form = {"home_id": home_id}
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/syncapi/v1/homestatus",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+            auth=True,
+        )
+
+    async def post_getconfigs(self) -> Dict[str, Any]:
+        """Fallback discovery endpoint that includes home(s) config; no home_id needed."""
+        await self.ensure_token()
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/syncapi/v1/getconfigs",
+            form={},
+            content_type="application/x-www-form-urlencoded",
+            auth=True,
+        )
+
+    async def post_gethomemeasure(
+        self, home_id: str, *, scale: str, offset: int = 0, limit: int = 30, rtype: Optional[str] = None
+    ) -> Dict[str, Any]:
+        await self.ensure_token()
+        form: Dict[str, Any] = {
+            "home_id": home_id,
+            "scale": scale,
+            "offset": offset,
+            "limit": limit,
+        }
+        if rtype:
+            form["type"] = rtype  # ex: "energy"
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/api/gethomemeasure",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+            auth=True,
+        )
+
+    async def post_setroomthermpoint(
+        self, home_id: str, room_id: str, mode: str, temp: Optional[float] = None, endtime: Optional[int] = None
+    ) -> Dict[str, Any]:
+        await self.ensure_token()
+        # L’API /api/setroomthermpoint accepte form-urlencoded (Netatmo-like) OU JSON.
+        # Ici on reste en form pour la compat.
+        form: Dict[str, Any] = {"home_id": home_id, "room_id": room_id, "mode": mode}
+        if isinstance(temp, (int, float)):
+            form["temp"] = float(temp)
+        if isinstance(endtime, (int, float)):
+            form["endtime"] = int(endtime)
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/api/setroomthermpoint",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+            auth=True,
+        )
+
+    async def post_setstate_rooms(
+        self, home_id: str, room_id: str, *, mode: str, temp: Optional[float] = None, endtime: Optional[int] = None
+    ) -> Dict[str, Any]:
+        await self.ensure_token()
+        # Méthode alignée sur ton flow Node-RED pour piloter une pièce via /syncapi/v1/setstate (JSON)
+        room: Dict[str, Any] = {
+            "id": room_id,
+            "therm_setpoint_mode": mode,  # "manual" | "home" | "away" | "hg" | "off"
+        }
+        if isinstance(temp, (int, float)):
+            room["therm_setpoint_temperature"] = float(temp)
+        if isinstance(endtime, (int, float)):
+            room["therm_setpoint_end_time"] = int(endtime)
+
+        body = {"home": {"id": home_id, "rooms": [room]}}
+
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/syncapi/v1/setstate",
+            json=body,
+            auth=True,
+        )
+
+    async def post_switchhomeschedule(self, home_id: str, schedule_id: str) -> Dict[str, Any]:
+        await self.ensure_token()
+        form = {"home_id": home_id, "schedule_id": schedule_id}
+        return await self._request_json(
+            "POST",
+            f"{BASE_HOST}/api/switchhomeschedule",
+            form=form,
+            content_type="application/x-www-form-urlencoded",
+            auth=True,
+        )
+
+
+# ---- High-level API used by the integration ------------------------------------
+
+
+class IntuisApi:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        username: str,
+        password: str,
+        client_id: str,
+        client_secret: str,
+        scope: str,
+        user_prefix: str,
+    ) -> None:
+        self._client = IntuisHttpClient(
+            session,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
+            user_prefix=user_prefix,
+            username=username,
+            password=password,
+        )
+        self._home_id: Optional[str] = None
+        self._username = username
+        self._password = password
+
+    # ---- Auth façade -----------------------------------------------------------
+
+    async def async_authenticate(self) -> None:
+        """Assure qu’un token est disponible (login/refresh au besoin)."""
+        await self._client.ensure_token()
+
+    async def login(self) -> Dict[str, Any]:
+        """Force un login (peu utilisé si async_authenticate est appelé)."""
+        return await self._client.login()
+
+    # ---- Home discovery --------------------------------------------------------
+
+        # ---- Home discovery (strict) ---------------------------------------------
+
+    # ---- Home discovery (STRICT: home à la racine) ---------------------------
+
+#-------- Extraction HOME (robuste) -----------------
+
+    def _extract_home_from_homesdata(self, payload: Any) -> dict:
+        """Accepte :
+           - OBJET home à la racine (ton cas) : {"id": "...", ...}
+           - sinon, tente: {"home": {...}}, {"homes": [{...}]}, [{"id": "..."}],
+             ou des wrappers génériques {"data": {...}}, {"result": {...}}, {"body": {...}}.
+        """
+        # Pour debug : type + 1er niveau
+        try:
+            if isinstance(payload, dict):
+                _LOGGER.debug("homesdata keys=%s", list(payload.keys())[:20])
+            else:
+                _LOGGER.debug("homesdata type=%s len=%s", type(payload), len(payload) if hasattr(payload, "__len__") else "?")
+        except Exception:
+            pass
+
+        # 1) Cas nominal : id à la racine
+        if isinstance(payload, dict) and "id" in payload:
+            return payload
+
+        # 2) Wrappers fréquents
+        if isinstance(payload, dict):
+            for k in ("home", "data", "result", "body"):
+                v = payload.get(k)
+                if isinstance(v, dict) and "id" in v:
+                    return v
+                if isinstance(v, list) and v and isinstance(v[0], dict) and "id" in v[0]:
+                    return v[0]
+
+            # {"homes": [...]}
+            v = payload.get("homes")
+            if isinstance(v, list) and v and isinstance(v[0], dict) and "id" in v[0]:
+                return v[0]
+
+        # 3) Réponse en liste simple
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "id" in payload[0]:
+            return payload[0]
+
+        # 4) Rien reconnu -> on logge l’échantillon exact pour voir ce qui arrive vraiment
+        try:
+            sample = json.dumps(payload)[:1000]
+        except Exception:
+            sample = str(payload)[:1000]
+        _LOGGER.error("homesdata sans 'id' détectable. Échantillon: %s", sample)
+        raise IntuisApiError("Schéma inattendu pour /api/homesdata (clé 'id' introuvable)")
+
+    async def get_home(self) -> dict:
+        """Retourne l’objet home depuis /api/homesdata, en respectant le schéma réel."""
+        if getattr(self, "_home_cache", None):
+            return self._home_cache
+
+        await self.async_authenticate()
+        data = await self._client.get_homesdata()
+
+        home = None
+
+        # Chemin attendu d'après ton retour réel
+        if isinstance(data, dict):
+            body = data.get("body")
+            if isinstance(body, dict):
+                homes = body.get("homes")
+                if isinstance(homes, list) and homes and isinstance(homes[0], dict):
+                    home = homes[0]
+
+        # Fallbacks simples utilisés parfois par des variantes
+        if home is None and isinstance(data, dict):
+            # { "homes": [ {...} ] }
+            homes = data.get("homes")
+            if isinstance(homes, list) and homes and isinstance(homes[0], dict):
+                home = homes[0]
+            # { "home": {...} }
+            if home is None and isinstance(data.get("home"), dict):
+                home = data["home"]
+
+        # Vérifications minimales
+        if not isinstance(home, dict):
+            raise IntuisApiError("Schéma inattendu pour /api/homesdata (objet 'home' introuvable)")
+
+        hid = str(home.get("id") or home.get("_id") or home.get("home_id") or "").strip()
+        if not hid:
+            # Log d’aide au debug avec un échantillon compact
+            try:
+                import json
+                sample = json.dumps(data, ensure_ascii=False)[:800]
+            except Exception:
+                sample = str(data)[:800]
+            _LOGGER.error("homesdata sans 'id' détectable. Échantillon: %s", sample)
+            raise IntuisApiError("Schéma inattendu pour /api/homesdata (clé 'id' introuvable)")
+
+        # Normalisation & cache
+        home["id"] = hid
+        self._home_cache = home
+        return home
+
+    async def get_home_id(self) -> str:
+        """Retourne l’ID du home (avec cache)."""
+        if getattr(self, "_home_cache", None):
+            hid = str(self._home_cache.get("id") or self._home_cache.get("_id") or self._home_cache.get("home_id") or "").strip()
+            if hid:
+                return hid
+        home = await self.get_home()
+        hid = str(home.get("id") or home.get("_id") or home.get("home_id") or "").strip()
+        if not hid:
+            raise IntuisApiError("home_id introuvable dans /api/homesdata")
+        return hid
+
+    async def get_home(self) -> dict:
+        payload = await self._client.get_homesdata()
+        return self._extract_home_from_homesdata(payload)
+
+
+    async def homestatus(self, home_id: Optional[str] = None) -> Dict[str, Any]:
+        hid = home_id or await self.get_home_id()
+        return await self._client.post_homestatus(hid)
+
+    async def gethomemeasure(
+        self,
+        home_id: Optional[str] = None,
+        *,
+        scale: str = "day",
+        offset: int = 0,
+        limit: int = 30,
+        rtype: Optional[str] = None,  # "energy" si supporté, sinon None
+    ) -> Dict[str, Any]:
+        hid = home_id or await self.get_home_id()
+        return await self._client.post_gethomemeasure(hid, scale=scale, offset=offset, limit=limit, rtype=rtype)
+
+    async def set_room_setpoint(
+        self, home_id: str, room_id: str, temp: float, duration: int | None = None
+    ) -> Dict[str, Any]:
+        """Passe la pièce en 'manual' à temp, optionnellement pour 'duration' minutes."""
+        endtime = None
+        if isinstance(duration, (int, float)) and duration > 0:
+            endtime = int(time.time() + float(duration) * 60.0)
+        # Utilise /api/setroomthermpoint (compatible Netatmo)
+        return await self._client.post_setroomthermpoint(
+            home_id=home_id, room_id=room_id, mode="manual", temp=float(temp), endtime=endtime
+        )
+
+    async def set_room_mode(
+        self,
+        home_id: str,
+        room_id: str,
+        mode: str,
+        *,
+        temp: Optional[float] = None,
+        endtime: Optional[int] = None,
+        use_setstate: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Change le mode d’une pièce.
+        Modes acceptés côté Intuis (observés dans ton flow): "manual" | "home" | "away" | "hg" | "off"
+        - Si temp/endtime fournis, ils sont transmis.
+        - Par défaut on utilise /syncapi/v1/setstate (JSON), plus robuste.
+        - Si besoin, on peut forcer la voie /api/setroomthermpoint en mettant use_setstate=False.
+        """
+        if use_setstate:
+            return await self._client.post_setstate_rooms(
+                home_id, room_id, mode=mode, temp=temp, endtime=endtime
+            )
+        # fallback netatmo-like
+        return await self._client.post_setroomthermpoint(
+            home_id=home_id, room_id=room_id, mode=mode, temp=temp, endtime=endtime
+        )
+
+    async def switch_home_schedule(self, home_id: str, schedule_id: str) -> Dict[str, Any]:
+        return await self._client.post_switchhomeschedule(home_id, schedule_id)
