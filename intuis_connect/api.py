@@ -228,13 +228,41 @@ class IntuisHttpClient:
         }
         if rtype:
             form["type"] = rtype  # ex: "energy"
-        return await self._request_json(
-            "POST",
-            f"{BASE_HOST}/api/gethomemeasure",
-            form=form,
-            content_type="application/x-www-form-urlencoded",
-            auth=True,
-        )
+
+        try:
+            return await self._request_json(
+                "POST",
+                f"{BASE_HOST}/api/gethomemeasure",
+                form=form,
+                content_type="application/x-www-form-urlencoded",
+                auth=True,
+            )
+        except IntuisApiError as err:
+            message = str(err)
+            if "gethomemeasure" not in message or "<id> is missing from home payload" not in message:
+                raise
+
+            _LOGGER.warning(
+                "gethomemeasure rejected form payload, retrying with JSON home body: %s",
+                message,
+            )
+
+            body: Dict[str, Any] = {
+                "home": {"id": home_id},
+                "home_id": home_id,
+                "scale": scale,
+                "offset": offset,
+                "limit": limit,
+            }
+            if rtype:
+                body["type"] = rtype
+
+            return await self._request_json(
+                "POST",
+                f"{BASE_HOST}/api/gethomemeasure",
+                json=body,
+                auth=True,
+            )
 
     async def post_setroomthermpoint(
         self, home_id: str, room_id: str, mode: str, temp: Optional[float] = None, endtime: Optional[int] = None
